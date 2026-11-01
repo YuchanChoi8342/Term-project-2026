@@ -1,0 +1,701 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+과제 안내문 린터 (Assignment Linter)
+요구사항 누락·모호성 탐지기
+
+사용법
+  python assignment_linter.py lint  sample_notice.txt              # 안내문 점검(출제자용)
+  python assignment_linter.py lint  sample_notice.txt -o lint.txt  # 점검 보고서 저장
+  python assignment_linter.py init  sample_notice.txt              # 요구사항 추출 + 체크리스트 모드(학생용)
+  python assignment_linter.py check                                # 저장된 체크리스트 이어서 편집
+  python assignment_linter.py report -o student_report.txt         # 제출 전 점검 보고서 저장
+  (파일 이름 대신 - 를 쓰면 표준입력에서 붙여넣기: 입력 후 Ctrl+D / Windows는 Ctrl+Z, Enter)
+
+외부 라이브러리 없이 표준 라이브러리만 사용한다.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+DEFAULT_STATE = "checklist.json"
+INF = float("inf")
+
+
+# ======================================================================
+# 1. 입력 처리: 파일 읽기, 문장 분리
+# ======================================================================
+@dataclass
+class Sentence:
+    line_no: int
+    text: str
+
+
+BULLET_RE = re.compile(r"^\s*(?:[-*•·▶■□○●]|\d+[.)]|\(\d+\)|[가-힣][.)])\s*")
+SENT_SPLIT_RE = re.compile(r"(?<=[.!?。])\s+")
+
+
+def load_text(path: str) -> str:
+    """파일(또는 '-'면 표준입력)을 읽는다. 한글 윈도우 파일(cp949)도 처리."""
+    if path == "-":
+        print("안내문을 붙여넣은 뒤 입력을 끝내세요 (Ctrl+D, Windows는 Ctrl+Z 후 Enter):")
+        return sys.stdin.read()
+    raw = Path(path).read_bytes()
+    for enc in ("utf-8-sig", "cp949", "euc-kr"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def split_sentences(text: str) -> list[Sentence]:
+    """줄 단위로 나눈 뒤 마침표/물음표/느낌표 기준으로 문장을 분리한다."""
+    result: list[Sentence] = []
+    for no, raw in enumerate(text.splitlines(), start=1):
+        line = BULLET_RE.sub("", raw).strip()
+        if not line:
+            continue
+        for part in SENT_SPLIT_RE.split(line):
+            part = part.strip()
+            if len(part) >= 2:
+                result.append(Sentence(no, part))
+    return result
+
+
+# ======================================================================
+# 2. 숫자 조건 추출 (분량·개수 제한)
+# ======================================================================
+KR_UNIT = r"(?:개(?!월)|쪽|페이지|줄|명|점|회|단어|글자|분|장|MB|KB|GB)"
+EN_UNIT = r"(?:pages?|lines?|files?|words?|functions?|members?|hours?|minutes?|seconds?|MB|KB|GB)(?![A-Za-z])"
+UNIT = rf"(?:{KR_UNIT}|{EN_UNIT})"
+
+UNIT_NORMALIZE = {
+    "쪽": "page", "페이지": "page", "page": "page", "pages": "page",
+    "line": "줄", "lines": "줄", "word": "단어", "words": "단어",
+    "file": "file", "files": "file", "function": "function", "functions": "function",
+    "member": "명", "members": "명", "hour": "시간", "hours": "시간",
+    "minute": "분", "minutes": "분", "second": "초", "seconds": "초",
+}
+
+# (정규식, 종류) — 위에서부터 우선 적용, 이미 잡힌 구간과 겹치면 건너뜀
+NUM_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(rf"(\d+)\s*[~\-–]\s*(\d+)\s*({UNIT})", re.I), "range"),
+    (re.compile(rf"(?:정확히|딱)\s*(\d+)\s*({UNIT})", re.I), "eq"),
+    (re.compile(rf"(?:exactly)\s+(\d+)\s*({UNIT})", re.I), "eq"),
+    (re.compile(rf"(?:최대|많아야|최대로)\s*(\d+)\s*({UNIT})", re.I), "le"),
+    (re.compile(rf"(?:at\s+most|no\s+more\s+than|up\s+to|maximum\s+of|max\.?)\s*(\d+)\s*({UNIT})", re.I), "le"),
+    (re.compile(rf"(?:최소|적어도)\s*(\d+)\s*({UNIT})", re.I), "ge"),
+    (re.compile(rf"(?:at\s+least|no\s+fewer\s+than|minimum\s+of|min\.?)\s*(\d+)\s*({UNIT})", re.I), "ge"),
+    (re.compile(rf"(\d+)\s*({UNIT})\s*(이하|이내|미만|까지)", re.I), "le_suffix"),
+    (re.compile(rf"(\d+)\s*({UNIT})\s*(이상|초과)", re.I), "ge_suffix"),
+]
+
+
+@dataclass
+class Constraint:
+    line_no: int
+    sentence: str
+    unit: str
+    lo: float
+    hi: float
+    raw: str  # 원문 표현 (예: '최대 3개')
+
+
+def _norm_unit(u: str) -> str:
+    u = u.lower()
+    return UNIT_NORMALIZE.get(u, u)
+
+
+def extract_constraints(sent: Sentence) -> list[Constraint]:
+    taken: list[tuple[int, int]] = []
+    found: list[Constraint] = []
+
+    def overlaps(span: tuple[int, int]) -> bool:
+        return any(not (span[1] <= a or span[0] >= b) for a, b in taken)
+
+    for pattern, kind in NUM_PATTERNS:
+        for m in pattern.finditer(sent.text):
+            if overlaps(m.span()):
+                continue
+            taken.append(m.span())
+            raw = m.group(0)
+            if kind == "range":
+                lo, hi, unit = float(m.group(1)), float(m.group(2)), m.group(3)
+            elif kind == "eq":
+                lo = hi = float(m.group(1)); unit = m.group(2)
+            elif kind == "le":
+                lo, hi, unit = -INF, float(m.group(1)), m.group(2)
+            elif kind == "ge":
+                lo, hi, unit = float(m.group(1)), INF, m.group(2)
+            elif kind == "le_suffix":
+                v = float(m.group(1)); unit = m.group(2)
+                lo, hi = -INF, (v - 1 if m.group(3) == "미만" else v)
+            else:  # ge_suffix
+                v = float(m.group(1)); unit = m.group(2)
+                lo, hi = (v + 1 if m.group(3) == "초과" else v), INF
+            found.append(Constraint(sent.line_no, sent.text, _norm_unit(unit), lo, hi, raw))
+    return found
+
+
+# ======================================================================
+# 3. 요구사항 후보 추출
+# ======================================================================
+# (분류, 정규식) — 위에서부터 먼저 맞는 분류를 사용한다
+CATEGORY_RULES: list[tuple[str, re.Pattern]] = [
+    ("금지", re.compile(r"금지|하지\s*(?:마|말)|해서는\s*안|안\s*된다|안\s*됩니다|불가|허용되지|"
+                      r"not\s+allowed|must\s+not|do\s+not|don't|prohibited|forbidden", re.I)),
+    ("제출", re.compile(r"제출|업로드|submit|upload", re.I)),
+    ("포함", re.compile(r"포함|첨부|include|attach", re.I)),
+    ("형식", re.compile(r"형식|양식|파일명|파일\s*이름|확장자|format|filename|template|"
+                      r"\.(?:py|pdf|zip|docx|hwp|txt|md|pptx|ipynb)\b", re.I)),
+    ("필수", re.compile(r"반드시|필수|해야|꼭|must|required|shall|need\s+to|have\s+to", re.I)),
+    ("권장", re.compile(r"가능하면|가급적|권장|바람직|선택|should|recommended|optional", re.I)),
+    ("사용", re.compile(r"사용|활용|이용|\buse\b|\busing\b", re.I)),
+    ("구현", re.compile(r"구현|작성|개발|implement|write|develop|create", re.I)),
+]
+RECOMMEND_RE = re.compile(r"가능하면|가급적|권장|바람직|선택|should|recommended|optional", re.I)
+MANDATORY_RE = re.compile(r"반드시|필수|해야|꼭|must|required|shall|need\s+to|have\s+to", re.I)
+
+# 문장 어미가 의무·지시를 나타내는 경우도 후보로 인정
+COMMAND_ENDING_RE = re.compile(r"(?:한다|하시오|하세요|할\s*것|바랍니다|합니다|하라|됩니다)\s*[.!]?$")
+
+
+@dataclass
+class Requirement:
+    id: int
+    text: str
+    category: str
+    strength: str  # 필수 / 권장 / 확인필요
+    done: bool = False
+    line_no: int = 0
+    note: str = ""
+
+
+def classify_sentence(sent: Sentence) -> Optional[tuple[str, str]]:
+    """문장이 요구사항 후보면 (분류, 강도)를 돌려주고 아니면 None."""
+    category = None
+    for name, rx in CATEGORY_RULES:
+        if rx.search(sent.text):
+            category = name
+            break
+    if (category is None or category in ("사용", "구현")) and extract_constraints(sent):
+        category = "분량"
+    if category is None and COMMAND_ENDING_RE.search(sent.text):
+        category = "기타"
+    if category is None:
+        return None
+
+    if RECOMMEND_RE.search(sent.text) and not MANDATORY_RE.search(sent.text):
+        strength = "권장"
+    elif MANDATORY_RE.search(sent.text) or category in ("금지", "제출", "분량"):
+        strength = "필수"
+    else:
+        strength = "확인필요"
+    return category, strength
+
+
+def extract_requirements(sentences: list[Sentence], start_id: int = 1) -> list[Requirement]:
+    reqs: list[Requirement] = []
+    seen: set[str] = set()
+    next_id = start_id
+    for s in sentences:
+        info = classify_sentence(s)
+        if info is None:
+            continue
+        key = re.sub(r"\s+", "", s.text)
+        if key in seen:
+            continue
+        seen.add(key)
+        reqs.append(Requirement(next_id, s.text, info[0], info[1], False, s.line_no))
+        next_id += 1
+    return reqs
+
+
+# ======================================================================
+# 4. 안내문 점검 (린트)
+# ======================================================================
+@dataclass
+class Warning_:
+    kind: str       # 모호 / 충돌 / 누락
+    severity: str   # 경고 / 참고
+    line_nos: list[int]
+    message: str
+    question: str = ""
+    excerpt: str = ""
+
+
+# (정규식, 표시 이름, 출제자에게 물어볼 질문)
+AMBIGUOUS_TERMS: list[tuple[re.Pattern, str, str]] = [
+    (re.compile(r"적절(?:히|한|하게)"), "적절히/적절한",
+     "'적절하다'의 기준은 무엇인가요? (예: 분량·횟수·형식을 수치로 제시)"),
+    (re.compile(r"충분(?:히|한|하게)"), "충분히/충분한",
+     "'충분'은 최소 어느 정도인가요? (예: 테스트 케이스 5개 이상)"),
+    (re.compile(r"가능하면|가능한\s*한|if\s+possible|when\s+possible", re.I), "가능하면",
+     "필수인가요, 선택인가요? 선택이라면 가산점/감점이 있나요?"),
+    (re.compile(r"가급적|되도록"), "가급적/되도록",
+     "예외를 허용하는 조건이 무엇인가요? 어기면 감점인가요?"),
+    (re.compile(r"최대한"), "최대한",
+     "'최대한'의 구체적 기준이나 상한이 있나요?"),
+    (re.compile(r"간단(?:히|하게)|간략(?:히|하게)"), "간단히/간략히",
+     "허용되는 분량(쪽수·줄 수)이 얼마인가요?"),
+    (re.compile(r"자세(?:히|하게)|상세(?:히|하게)"), "자세히/상세히",
+     "어느 수준까지 써야 하나요? (예: 함수별 설명 포함 여부, 최소 분량)"),
+    (re.compile(r"깔끔(?:하게|한)|보기\s*좋게|읽기\s*쉽게"), "깔끔하게",
+     "코드/문서 스타일 기준(PEP8, 주석 규칙 등)이 있나요?"),
+    (re.compile(r"알아서|자유롭게|자율적으로"), "알아서/자유롭게",
+     "자유롭게 해도 되는 범위와 반드시 지켜야 할 범위를 구분해 주실 수 있나요?"),
+    (re.compile(r"(?<![가-힣])등(?:(?=[을를은는이가의에과와도으로])|(?![가-힣]))|기타|and\s+so\s+on|\betc\b\.?", re.I),
+     "등/기타",
+     "'등'에 해당하는 항목이 정확히 무엇인가요? 나열되지 않은 항목도 필수인가요?"),
+    (re.compile(r"어느\s*정도|상당(?:한|히)|약간|다소|적당(?:히|한)"), "어느 정도/상당한",
+     "정도를 수치나 예시로 알려 주실 수 있나요?"),
+    (re.compile(r"합리적|효율적|창의적"), "합리적/효율적/창의적",
+     "평가 시 무엇을 기준으로 판단하나요? (평가 루브릭이 있나요?)"),
+    (re.compile(r"appropriate(?:ly)?|sufficient(?:ly)?|reasonabl[ey]|adequate(?:ly)?|properly|"
+                r"as\s+needed|as\s+necessary", re.I), "appropriate/sufficient 등",
+     "What exact criteria define this (numbers, examples, rubric)?"),
+    (re.compile(r"빠른\s*시일|조속히|가능한\s*빨리|asap", re.I), "빠른 시일 내",
+     "정확한 기한(날짜·시간)이 언제인가요?"),
+]
+
+
+def lint_ambiguity(sentences: list[Sentence]) -> list[Warning_]:
+    out: list[Warning_] = []
+    for s in sentences:
+        for rx, label, question in AMBIGUOUS_TERMS:
+            m = rx.search(s.text)
+            if m:
+                out.append(Warning_(
+                    "모호", "경고", [s.line_no],
+                    f"모호한 표현 '{m.group(0)}' ({label})",
+                    question, s.text))
+    return out
+
+
+# ---------- 조건 충돌 ----------
+STOP_TOKENS = {
+    "최대", "최소", "이상", "이하", "이내", "미만", "초과", "정확히", "제출", "한다", "해야",
+    "반드시", "포함", "사용", "작성", "구현", "합니다", "하시오", "있다", "없다", "경우",
+    "때문", "그리고", "또한", "각각", "모든", "the", "and", "must", "should", "least", "most",
+    "than", "more", "fewer", "your", "with", "that", "this", "have", "include",
+}
+JOSA = sorted(["으로", "에서", "에는", "에게", "까지", "부터", "은", "는", "이", "가", "을", "를",
+               "의", "에", "와", "과", "도", "로", "만"], key=len, reverse=True)
+
+
+def content_tokens(text: str) -> set[str]:
+    tokens = set()
+    for tok in re.findall(r"[가-힣A-Za-z]{2,}", text):
+        tok = tok.lower()
+        for j in JOSA:
+            if tok.endswith(j) and len(tok) - len(j) >= 2:
+                tok = tok[: -len(j)]
+                break
+        if tok not in STOP_TOKENS and not re.fullmatch(KR_UNIT, tok):
+            tokens.add(tok)
+    return tokens
+
+
+def lint_conflicts(sentences: list[Sentence]) -> list[Warning_]:
+    constraints: list[Constraint] = []
+    for s in sentences:
+        constraints.extend(extract_constraints(s))
+
+    out: list[Warning_] = []
+    reported: set[tuple[int, int, str]] = set()
+    for i in range(len(constraints)):
+        for j in range(i + 1, len(constraints)):
+            a, b = constraints[i], constraints[j]
+            if a.unit != b.unit:
+                continue
+            # 같은 대상을 말하는지 판단: 문장 간 공통 단어가 있어야 함 (오탐 방지)
+            shared = content_tokens(a.sentence) & content_tokens(b.sentence)
+            if not shared and a.sentence != b.sentence:
+                continue
+            if max(a.lo, b.lo) > min(a.hi, b.hi):
+                key = (a.line_no, b.line_no, a.unit)
+                if key in reported:
+                    continue
+                reported.add(key)
+                hint = f" (공통 키워드: {', '.join(sorted(shared)[:3])})" if shared else ""
+                out.append(Warning_(
+                    "충돌", "경고", sorted({a.line_no, b.line_no}),
+                    f"숫자 조건이 서로 맞지 않을 수 있음: '{a.raw}' ↔ '{b.raw}'{hint}",
+                    "두 조건 중 어느 쪽이 맞나요? 서로 다른 대상을 가리키는 것이라면 대상을 구분해 써 주세요.",
+                    f"[{a.line_no}행] {a.sentence}\n    [{b.line_no}행] {b.sentence}"))
+    return out
+
+
+# ---------- 누락 정보 ----------
+DATE_RE = re.compile(
+    r"\d{4}\s*[-./년]\s*\d{1,2}\s*[-./월]\s*\d{1,2}|\d{1,2}\s*월\s*\d{1,2}\s*일|\b\d{1,2}/\d{1,2}\b|"
+    r"[월화수목금토일]요일|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}",
+    re.I)
+DEADLINE_KW_RE = re.compile(r"마감|기한|까지|deadline|due|by\s", re.I)       # 날짜와 같은 문장일 때
+DEADLINE_WORD_RE = re.compile(r"마감|기한|deadline|\bdue\b", re.I)            # 단독으로도 마감 언급
+METHOD_RE = re.compile(
+    r"이메일|e-?mail|메일|lms|e-?class|이클래스|깃허브|github|gitlab|블랙보드|blackboard|classroom|"
+    r"구글\s*폼|google\s*form|업로드|upload|직접\s*제출|출력(?:하여|해서)|오프라인|카카오|slack|디스코드|"
+    r"포털|사이트|홈페이지", re.I)
+FORMAT_RE = re.compile(
+    r"\.(?:py|pdf|zip|docx?|hwp|txt|md|pptx?|ipynb|java|c|cpp|csv|xlsx?)\b|pdf|zip|hwp|docx|pptx|"
+    r"파일\s*(?:형식|이름|명)|파일명|확장자|양식|형식|format", re.I)
+LATE_RE = re.compile(r"지각|늦(?:게|은)|late|지연\s*제출|감점|penalt", re.I)
+GRADING_RE = re.compile(r"배점|평가\s*(?:기준|항목)|채점|점수|grading|rubric|%\s*(?:반영|비중)", re.I)
+CONTACT_RE = re.compile(r"문의|질문|연락|contact|question|@\w+|조교|TA\b", re.I)
+
+
+def lint_missing(text: str, sentences: list[Sentence]) -> list[Warning_]:
+    out: list[Warning_] = []
+
+    # 마감일: 날짜 표현이 마감 관련 단어와 같은 문장에 있어야 함
+    has_date = any(DATE_RE.search(s.text) and DEADLINE_KW_RE.search(s.text) for s in sentences)
+    has_deadline_word = bool(DEADLINE_WORD_RE.search(text))
+    if not has_date:
+        if has_deadline_word:
+            msg, q = ("마감 관련 표현은 있으나 구체적인 날짜·시간이 보이지 않음",
+                      "마감 날짜와 시각(예: 11월 20일 23:59)을 알려 주세요.")
+        else:
+            msg, q = ("마감일 정보가 없음", "제출 마감 날짜와 시각이 언제인가요?")
+        out.append(Warning_("누락", "경고", [], msg, q))
+
+    if not METHOD_RE.search(text):
+        out.append(Warning_("누락", "경고", [], "제출 방법(제출 장소·채널)이 없음",
+                            "어디로 제출하나요? (LMS, 이메일, GitHub 등)"))
+    if not FORMAT_RE.search(text):
+        out.append(Warning_("누락", "경고", [], "제출 형식(파일 종류·파일명 규칙)이 없음",
+                            "어떤 파일 형식으로 제출하나요? 파일명 규칙이 있나요?"))
+    if not LATE_RE.search(text):
+        out.append(Warning_("누락", "참고", [], "지각 제출 규정이 없음",
+                            "마감 이후 제출을 허용하나요? 허용한다면 감점 기준은요?"))
+    if not GRADING_RE.search(text):
+        out.append(Warning_("누락", "참고", [], "평가 기준·배점이 없음",
+                            "무엇을 기준으로 채점하나요? (배점표/루브릭)"))
+    if not CONTACT_RE.search(text):
+        out.append(Warning_("누락", "참고", [], "문의 방법이 없음",
+                            "안내문에 대해 질문할 연락처/채널이 있나요?"))
+    return out
+
+
+def run_lint(text: str) -> tuple[list[Sentence], list[Warning_]]:
+    sentences = split_sentences(text)
+    warnings = lint_ambiguity(sentences) + lint_conflicts(sentences) + lint_missing(text, sentences)
+    return sentences, warnings
+
+
+# ======================================================================
+# 5. 체크리스트 (상태 저장·편집)
+# ======================================================================
+@dataclass
+class Checklist:
+    source: str = ""
+    created: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M"))
+    items: list[Requirement] = field(default_factory=list)
+
+    def _next_id(self) -> int:
+        return max((i.id for i in self.items), default=0) + 1
+
+    def get(self, item_id: int) -> Optional[Requirement]:
+        return next((i for i in self.items if i.id == item_id), None)
+
+    def add(self, text: str, category: str = "직접추가", strength: str = "필수") -> Requirement:
+        item = Requirement(self._next_id(), text.strip(), category, strength)
+        self.items.append(item)
+        return item
+
+    def edit(self, item_id: int, text: str) -> bool:
+        item = self.get(item_id)
+        if item:
+            item.text = text.strip()
+        return item is not None
+
+    def delete(self, item_id: int) -> bool:
+        item = self.get(item_id)
+        if item:
+            self.items.remove(item)
+        return item is not None
+
+    def set_done(self, item_id: int, done: bool) -> bool:
+        item = self.get(item_id)
+        if item:
+            item.done = done
+        return item is not None
+
+    def progress(self) -> tuple[int, int]:
+        total = len(self.items)
+        return sum(1 for i in self.items if i.done), total
+
+    def save(self, path: str) -> None:
+        data = {"source": self.source, "created": self.created,
+                "items": [asdict(i) for i in self.items]}
+        Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    @classmethod
+    def load(cls, path: str) -> "Checklist":
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return cls(data.get("source", ""), data.get("created", ""),
+                   [Requirement(**i) for i in data.get("items", [])])
+
+
+def progress_bar(done: int, total: int, width: int = 20) -> str:
+    ratio = done / total if total else 0
+    filled = round(ratio * width)
+    return f"[{'#' * filled}{'-' * (width - filled)}] {done}/{total} ({ratio * 100:.0f}%)"
+
+
+# ======================================================================
+# 6. 출력: 화면·보고서
+# ======================================================================
+def format_checklist(cl: Checklist, only_pending: bool = False) -> str:
+    lines = []
+    for it in cl.items:
+        if only_pending and it.done:
+            continue
+        mark = "x" if it.done else " "
+        lines.append(f" {it.id:>2}. [{mark}] ({it.category}/{it.strength}) {it.text}")
+        if it.note:
+            lines.append(f"        메모: {it.note}")
+    return "\n".join(lines) if lines else "  (항목 없음)"
+
+
+def format_warnings(warnings: list[Warning_]) -> str:
+    if not warnings:
+        return "발견된 문제가 없습니다."
+    groups = {"모호": "모호한 표현", "충돌": "조건 충돌", "누락": "누락 정보"}
+    out = []
+    for kind, title in groups.items():
+        items = [w for w in warnings if w.kind == kind]
+        if not items:
+            continue
+        out.append(f"■ {title} ({len(items)}건)")
+        for n, w in enumerate(items, 1):
+            where = f" [{', '.join(map(str, w.line_nos))}행]" if w.line_nos else ""
+            out.append(f"  {n}. ({w.severity}){where} {w.message}")
+            if w.excerpt:
+                out.append(f"     원문: {w.excerpt}")
+            if w.question:
+                out.append(f"     → 확인 질문: {w.question}")
+        out.append("")
+    return "\n".join(out).rstrip()
+
+
+def build_instructor_report(source: str, warnings: list[Warning_]) -> str:
+    n_warn = sum(1 for w in warnings if w.severity == "경고")
+    n_info = len(warnings) - n_warn
+    head = [
+        "=" * 60,
+        " 과제 안내문 점검 보고서 (출제자용)",
+        f" 대상: {source}   생성: {datetime.now():%Y-%m-%d %H:%M}",
+        f" 경고 {n_warn}건 / 참고 {n_info}건",
+        "=" * 60, "",
+    ]
+    body = format_warnings(warnings)
+    questions = [w.question for w in warnings if w.question and w.severity == "경고"]
+    tail = ["", "-" * 60, "수정 전에 확인할 질문 목록 (경고 항목)"]
+    tail += [f"  Q{n}. {q}" for n, q in enumerate(dict.fromkeys(questions), 1)] or ["  (없음)"]
+    return "\n".join(head) + body + "\n" + "\n".join(tail) + "\n"
+
+
+def build_student_report(cl: Checklist) -> str:
+    done, total = cl.progress()
+    lines = [
+        "=" * 60,
+        " 제출 전 점검 보고서 (학생용)",
+        f" 안내문: {cl.source or '(미지정)'}   생성: {datetime.now():%Y-%m-%d %H:%M}",
+        f" 진행률 {progress_bar(done, total)}",
+        "=" * 60, "",
+    ]
+    pending = [i for i in cl.items if not i.done]
+    if not pending:
+        lines.append("모든 항목을 완료했습니다. 제출 방법과 마감 시각을 마지막으로 확인하세요.")
+    else:
+        lines.append(f"■ 미완료 항목 {len(pending)}개")
+        by_cat: dict[str, list[Requirement]] = {}
+        for it in pending:
+            by_cat.setdefault(it.category, []).append(it)
+        for cat, its in by_cat.items():
+            lines.append(f"\n  [{cat}]")
+            for it in its:
+                lines.append(f"   - ({it.strength}) #{it.id} {it.text}")
+                if it.note:
+                    lines.append(f"       메모: {it.note}")
+    finished = [i for i in cl.items if i.done]
+    if finished:
+        lines.append(f"\n■ 완료 항목 {len(finished)}개")
+        lines += [f"   - #{i.id} {i.text}" for i in finished]
+    return "\n".join(lines) + "\n"
+
+
+# ======================================================================
+# 7. 대화형 체크리스트 모드
+# ======================================================================
+HELP = """명령어
+  ls              전체 목록        pending / p   미완료만 보기
+  done 1 3 5      완료 처리        undo 2        완료 취소
+  add 내용        항목 추가        edit 3 내용   항목 수정
+  del 4           항목 삭제        note 2 메모   메모 달기
+  report [파일]   제출 전 점검 보고서 저장 (기본: student_report.txt)
+  help            도움말           q             저장하고 종료"""
+
+
+def parse_ids(args: list[str]) -> list[int]:
+    ids = []
+    for a in args:
+        if a.isdigit():
+            ids.append(int(a))
+    return ids
+
+
+def interactive(cl: Checklist, state_path: str) -> None:
+    print("\n" + HELP + "\n")
+    print(format_checklist(cl))
+    print(progress_bar(*cl.progress()))
+    while True:
+        try:
+            raw = input("\n> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not raw:
+            continue
+        cmd, *rest = raw.split(maxsplit=1)
+        arg = rest[0] if rest else ""
+        changed = True
+
+        if cmd in ("q", "quit", "exit"):
+            break
+        elif cmd in ("ls", "list"):
+            print(format_checklist(cl)); changed = False
+        elif cmd in ("p", "pending"):
+            print(format_checklist(cl, only_pending=True)); changed = False
+        elif cmd == "done":
+            for i in parse_ids(arg.split()):
+                print(f"  #{i} 완료" if cl.set_done(i, True) else f"  #{i} 없음")
+        elif cmd == "undo":
+            for i in parse_ids(arg.split()):
+                print(f"  #{i} 완료 취소" if cl.set_done(i, False) else f"  #{i} 없음")
+        elif cmd == "add":
+            if arg:
+                it = cl.add(arg); print(f"  #{it.id} 추가됨")
+            else:
+                print("  사용법: add 내용"); changed = False
+        elif cmd == "edit":
+            parts = arg.split(maxsplit=1)
+            if len(parts) == 2 and parts[0].isdigit():
+                print("  수정됨" if cl.edit(int(parts[0]), parts[1]) else "  없는 번호")
+            else:
+                print("  사용법: edit 번호 새내용"); changed = False
+        elif cmd in ("del", "rm"):
+            for i in parse_ids(arg.split()):
+                print(f"  #{i} 삭제" if cl.delete(i) else f"  #{i} 없음")
+        elif cmd == "note":
+            parts = arg.split(maxsplit=1)
+            if len(parts) == 2 and parts[0].isdigit() and cl.get(int(parts[0])):
+                cl.get(int(parts[0])).note = parts[1]; print("  메모 저장")
+            else:
+                print("  사용법: note 번호 메모"); changed = False
+        elif cmd == "report":
+            out = arg or "student_report.txt"
+            Path(out).write_text(build_student_report(cl), encoding="utf-8")
+            print(f"  저장: {out}"); changed = False
+        elif cmd in ("help", "h", "?"):
+            print(HELP); changed = False
+        else:
+            print("  알 수 없는 명령입니다. help 를 입력하세요."); changed = False
+
+        if changed:
+            cl.save(state_path)
+            print("  " + progress_bar(*cl.progress()))
+    cl.save(state_path)
+    print(f"저장됨: {state_path}")
+
+
+# ======================================================================
+# 8. CLI
+# ======================================================================
+def cmd_lint(args: argparse.Namespace) -> None:
+    text = load_text(args.file)
+    _, warnings = run_lint(text)
+    report = build_instructor_report(args.file, warnings)
+    print(report)
+    if args.output:
+        Path(args.output).write_text(report, encoding="utf-8")
+        print(f"보고서 저장: {args.output}")
+
+
+def cmd_init(args: argparse.Namespace) -> None:
+    text = load_text(args.file)
+    sentences, warnings = run_lint(text)
+    cl = Checklist(source=args.file)
+    cl.items = extract_requirements(sentences)
+    cl.save(args.state)
+
+    print(f"요구사항 후보 {len(cl.items)}개를 찾았습니다. (최종 판단은 직접 해 주세요)\n")
+    print(format_checklist(cl))
+    alerts = [w for w in warnings if w.severity == "경고"]
+    if alerts:
+        print(f"\n⚠ 안내문 자체에 확인이 필요한 부분이 {len(alerts)}건 있습니다. "
+              f"자세히 보려면: python {Path(sys.argv[0]).name} lint {args.file}")
+    if not args.no_interactive:
+        interactive(cl, args.state)
+
+
+def cmd_check(args: argparse.Namespace) -> None:
+    if not Path(args.state).exists():
+        sys.exit(f"{args.state} 파일이 없습니다. 먼저 init 으로 안내문을 불러오세요.")
+    interactive(Checklist.load(args.state), args.state)
+
+
+def cmd_report(args: argparse.Namespace) -> None:
+    if not Path(args.state).exists():
+        sys.exit(f"{args.state} 파일이 없습니다.")
+    report = build_student_report(Checklist.load(args.state))
+    print(report)
+    if args.output:
+        Path(args.output).write_text(report, encoding="utf-8")
+        print(f"보고서 저장: {args.output}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="과제 안내문 린터: 요구사항 누락·모호성 탐지기")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    s = sub.add_parser("lint", help="안내문의 모호함·충돌·누락 점검 (출제자용)")
+    s.add_argument("file", help="안내문 텍스트 파일 ('-'는 붙여넣기)")
+    s.add_argument("-o", "--output", help="보고서 저장 경로")
+    s.set_defaults(func=cmd_lint)
+
+    s = sub.add_parser("init", help="요구사항 후보 추출 후 체크리스트 시작 (학생용)")
+    s.add_argument("file", help="안내문 텍스트 파일 ('-'는 붙여넣기)")
+    s.add_argument("-s", "--state", default=DEFAULT_STATE, help=f"저장 파일 (기본 {DEFAULT_STATE})")
+    s.add_argument("--no-interactive", action="store_true", help="추출·저장만 하고 종료")
+    s.set_defaults(func=cmd_init)
+
+    s = sub.add_parser("check", help="저장된 체크리스트 이어서 편집")
+    s.add_argument("-s", "--state", default=DEFAULT_STATE)
+    s.set_defaults(func=cmd_check)
+
+    s = sub.add_parser("report", help="제출 전 점검 보고서 출력/저장")
+    s.add_argument("-s", "--state", default=DEFAULT_STATE)
+    s.add_argument("-o", "--output", help="보고서 저장 경로")
+    s.set_defaults(func=cmd_report)
+    return p
+
+
+def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    args = build_parser().parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
