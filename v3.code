@@ -1,9 +1,3 @@
-"""과제 안내문 린터 - 데스크톱 화면 (tkinter)
-
-사용법: 기존 린터 파일(term_project_oss_demo.py)과 같은 폴더에 두고 실행하세요.
-  VS Code에서 ▶ 버튼을 누르거나  python linter_gui.py
-기존 파일의 검사 로직을 그대로 불러와 쓰므로, 기존 파일은 수정하지 않아도 됩니다.
-"""
 from __future__ import annotations
 
 import importlib.util
