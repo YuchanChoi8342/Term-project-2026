@@ -1,0 +1,626 @@
+from __future__ import annotations
+
+import importlib.util
+import re
+import sys
+import webbrowser
+from datetime import date
+from pathlib import Path
+import tkinter as tk
+from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import font as tkfont
+
+HERE = Path(__file__).resolve().parent
+
+# ---------------------------------------------------------------- 색상
+INK = "#1E2A44"        # 헤더·본문 글자
+PAPER = "#F4F6FB"      # 바탕
+CARD = "#FFFFFF"
+LINE = "#DCE1EE"
+MUTED = "#66728F"
+MARK = "#FFE45C"       # 형광펜: 이 앱의 포인트 색 (검사 버튼, 선택한 줄)
+WARN = "#D64545"
+WARN_BG = "#FFDADA"
+INFO = "#C98A1B"
+INFO_BG = "#FFF0C2"
+OK = "#2E8B57"
+GRADE_COLORS = {"A": "#2E8B57", "B": "#2F6FDE", "C": "#C98A1B", "D": "#D2691E", "F": "#D64545"}
+
+
+# ---------------------------------------------------------------- 기존 코드 불러오기
+def load_core():
+    """같은 폴더에서 run_lint 함수가 들어 있는 린터 파일을 찾아 모듈로 불러온다."""
+    me = Path(__file__).resolve()
+    names = ["term_project_oss_demo.py", "assignment_linter.py", "term_project_oss.py"]
+    cands = [HERE / n for n in names] + sorted(HERE.glob("*.py"))
+    seen = set()
+    for p in cands:
+        if p in seen or not p.exists() or p.resolve() == me:
+            continue
+        seen.add(p)
+        try:
+            if "def run_lint" not in p.read_text(encoding="utf-8", errors="ignore"):
+                continue
+            name = "linter_core"
+            spec = importlib.util.spec_from_file_location(name, p)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[name] = mod  # dataclass가 모듈을 찾을 수 있도록 먼저 등록
+            spec.loader.exec_module(mod)
+            return mod, p.name
+        except Exception:
+            continue
+    return None, ""
+
+
+# ---------------------------------------------------------------- 앱
+class App(tk.Tk):
+    def __init__(self, core, core_name: str):
+        super().__init__()
+        self.core = core
+        self.today = date.today()
+        self.findings: list = []
+        self.deadlines: list = []
+        self.score = None
+        self.source = "직접 입력"
+        self.scrollers: dict = {}
+        self.checklist = core.Checklist()
+        self.state_path = str(HERE / core.DEFAULT_STATE)
+
+        self.title("과제 안내문 린터")
+        self.geometry("1320x820")
+        self.minsize(1040, 660)
+        self.configure(bg=PAPER)
+
+        have = set(tkfont.families())
+        pick = lambda cs, fb: next((c for c in cs if c in have), fb)  # noqa: E731
+        self.ui = pick(("Malgun Gothic", "맑은 고딕", "Apple SD Gothic Neo", "NanumGothic", "Noto Sans CJK KR"),
+                       "TkDefaultFont")
+        self.mono = pick(("D2Coding", "Consolas", "Menlo", "Courier New"), "TkFixedFont")
+
+        self._style()
+        self._header(core_name)
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True, padx=16, pady=(12, 16))
+        self._tab_lint()
+        self._tab_check()
+        self._tab_audit()
+        self._tab_diff()
+        self.bind_all("<MouseWheel>", self._on_wheel)
+
+        if Path(self.state_path).exists():
+            try:
+                self.checklist = core.Checklist.load(self.state_path)
+            except Exception:
+                pass
+        self.refresh_check()
+        self.load_demo(run=True)
+
+    # ------------------------------------------------------------ 공통 도우미
+    def f(self, size=10, bold=False):
+        return (self.ui, size, "bold") if bold else (self.ui, size)
+
+    def _style(self):
+        st = ttk.Style(self)
+        st.theme_use("clam")
+        st.configure("TNotebook", background=PAPER, borderwidth=0)
+        st.configure("TNotebook.Tab", padding=(20, 9), font=self.f(10, True),
+                     background="#E4E8F3", foreground=MUTED, borderwidth=0)
+        st.map("TNotebook.Tab", background=[("selected", CARD)], foreground=[("selected", INK)])
+        st.configure("Treeview", rowheight=30, font=self.f(10), background=CARD, fieldbackground=CARD,
+                     foreground=INK, borderwidth=0)
+        st.configure("Treeview.Heading", font=self.f(10, True), background="#E4E8F3", foreground=INK,
+                     relief="flat")
+        st.map("Treeview", background=[("selected", "#E7EBFA")], foreground=[("selected", INK)])
+        st.configure("Horizontal.TProgressbar", troughcolor=LINE, background=OK, borderwidth=0, thickness=10)
+        st.configure("TCombobox", padding=4)
+
+    def button(self, parent, text, cmd, kind="plain"):
+        look = {"mark": (MARK, INK, "#FFD92E"), "dark": ("#2C3A5C", "white", "#3A4B73"),
+                "plain": (CARD, INK, "#EAEDF6")}[kind]
+        return tk.Button(parent, text=text, command=cmd, bg=look[0], fg=look[1], activebackground=look[2],
+                         activeforeground=look[1], relief="flat", bd=0, padx=14, pady=7,
+                         font=self.f(10, kind == "mark"), cursor="hand2")
+
+    def scroll_area(self, parent, bg=PAPER):
+        wrap = tk.Frame(parent, bg=bg)
+        cv = tk.Canvas(wrap, bg=bg, highlightthickness=0)
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=cv.yview)
+        inner = tk.Frame(cv, bg=bg)
+        win = cv.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
+        cv.bind("<Configure>", lambda e: cv.itemconfigure(win, width=e.width))
+        cv.configure(yscrollcommand=sb.set)
+        cv.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.scrollers[wrap] = cv
+        return wrap, inner
+
+    def _on_wheel(self, e):
+        w = self.winfo_containing(e.x_root, e.y_root)
+        while w is not None:
+            if w in self.scrollers:
+                self.scrollers[w].yview_scroll(int(-e.delta / 120), "units")
+                return
+            w = w.master
+
+    def text_box(self, parent, mono=False, bg=CARD):
+        box = tk.Frame(parent, bg=LINE)
+        t = tk.Text(box, wrap="word", font=(self.mono, 10) if mono else self.f(11), bg=bg, fg=INK, relief="flat",
+                    bd=0, padx=14, pady=12, spacing1=2, spacing3=2, insertbackground=INK, undo=True)
+        sb = ttk.Scrollbar(box, orient="vertical", command=t.yview)
+        t.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        t.pack(side="left", fill="both", expand=True, padx=1, pady=1)
+        return box, t
+
+    def open_notice(self, path=None):
+        path = path or filedialog.askopenfilename(title="안내문 열기",
+                                                   filetypes=[("텍스트", "*.txt *.md"), ("모든 파일", "*.*")])
+        if not path:
+            return
+        self.editor.delete("1.0", "end")
+        self.editor.insert("1.0", self.core.load_text(path))
+        self.source = Path(path).name
+        self.file_label.config(text=self.source)
+        self.nb.select(0)
+        self.run_lint_now()
+
+    def load_demo(self, run=False):
+        (HERE / "sample_notice.txt").write_text(self.core.DEMO_V1, encoding="utf-8")
+        (HERE / "sample_notice_v2.txt").write_text(self.core.DEMO_V2, encoding="utf-8")
+        self.editor.delete("1.0", "end")
+        self.editor.insert("1.0", self.core.DEMO_V1)
+        self.source = "sample_notice.txt"
+        self.file_label.config(text="연습용 안내문 (sample_notice.txt)")
+        self.old_var.set(str(HERE / "sample_notice.txt"))
+        self.new_var.set(str(HERE / "sample_notice_v2.txt"))
+        self.nb.select(0)
+        if run:
+            self.run_lint_now()
+
+    def _header(self, core_name):
+        bar = tk.Frame(self, bg=INK)
+        bar.pack(fill="x")
+        left = tk.Frame(bar, bg=INK)
+        left.pack(side="left", padx=22, pady=14)
+        tk.Label(left, text="과제 안내문 린터", bg=INK, fg="white", font=self.f(17, True)).pack(anchor="w")
+        tk.Label(left, text="안내문의 모호함, 충돌, 마감 문제를 제출 전에 찾아냅니다", bg=INK, fg="#AEB9D6",
+                 font=self.f(10)).pack(anchor="w", pady=(2, 0))
+        right = tk.Frame(bar, bg=INK)
+        right.pack(side="right", padx=22)
+        self.button(right, "파일 열기", self.open_notice, "dark").pack(side="left", padx=4)
+        self.button(right, "연습용 안내문", self.load_demo_and_run, "dark").pack(side="left", padx=4)
+        self.button(right, "검사하기", self.run_lint_now, "mark").pack(side="left", padx=(12, 0))
+
+    def load_demo_and_run(self):
+        self.load_demo(run=True)
+
+    # ------------------------------------------------------------ 탭 1: 안내문 점검
+    def _tab_lint(self):
+        tab = tk.Frame(self.nb, bg=PAPER)
+        self.nb.add(tab, text="  안내문 점검  ")
+        pan = tk.PanedWindow(tab, orient="horizontal", bg=PAPER, sashwidth=8, sashrelief="flat", bd=0)
+        pan.pack(fill="both", expand=True, padx=12, pady=12)
+
+        # 왼쪽: 안내문 편집기
+        left = tk.Frame(pan, bg=PAPER)
+        top = tk.Frame(left, bg=PAPER)
+        top.pack(fill="x", pady=(0, 6))
+        tk.Label(top, text="안내문", bg=PAPER, fg=INK, font=self.f(12, True)).pack(side="left")
+        self.file_label = tk.Label(top, text="", bg=PAPER, fg=MUTED, font=self.f(9))
+        self.file_label.pack(side="left", padx=10)
+        box, self.editor = self.text_box(left)
+        box.pack(fill="both", expand=True)
+        self.editor.tag_configure("info", background=INFO_BG)
+        self.editor.tag_configure("warn", background=WARN_BG)
+        self.editor.tag_configure("focus", background=MARK)
+        tk.Label(left, text="붉은 줄은 경고, 노란 줄은 참고입니다. 오른쪽 카드를 누르면 해당 줄로 이동합니다.",
+                 bg=PAPER, fg=MUTED, font=self.f(9)).pack(anchor="w", pady=(6, 0))
+        pan.add(left, minsize=380, width=560)
+
+        # 오른쪽: 결과
+        right = tk.Frame(pan, bg=PAPER)
+        self.score_cv = tk.Canvas(right, width=420, height=122, bg=CARD, highlightthickness=1,
+                                  highlightbackground=LINE)
+        self.score_cv.pack(fill="x")
+        self.grade_msg = tk.Label(right, text="", bg=PAPER, fg=INK, font=self.f(10), anchor="w",
+                                  justify="left", wraplength=620)
+        self.grade_msg.pack(fill="x", pady=(8, 0))
+        self.timeline = tk.Label(right, text="", bg=PAPER, fg=MUTED, font=(self.mono, 9), anchor="w",
+                                 justify="left")
+        self.timeline.pack(fill="x", pady=(4, 6))
+
+        frow = tk.Frame(right, bg=PAPER)
+        frow.pack(fill="x")
+        self.count_label = tk.Label(frow, text="", bg=PAPER, fg=INK, font=self.f(11, True))
+        self.count_label.pack(side="left")
+        self.kind_var = tk.StringVar(value="전체")
+        cb = ttk.Combobox(frow, textvariable=self.kind_var, state="readonly", width=8,
+                          values=("전체", "모호", "충돌", "일정", "누락"))
+        cb.pack(side="right")
+        cb.bind("<<ComboboxSelected>>", lambda e: self.render_findings())
+        tk.Label(frow, text="분류", bg=PAPER, fg=MUTED, font=self.f(9)).pack(side="right", padx=6)
+
+        wrap, self.cards = self.scroll_area(right)
+        wrap.pack(fill="both", expand=True, pady=6)
+
+        act = tk.Frame(right, bg=PAPER)
+        act.pack(fill="x")
+        self.button(act, "질문 메일 만들기", self.show_mail).pack(side="left")
+        self.button(act, "보고서 저장", self.save_report).pack(side="left", padx=8)
+        pan.add(right, minsize=460)
+
+    def run_lint_now(self):
+        text = self.editor.get("1.0", "end-1c")
+        if not text.strip():
+            messagebox.showinfo("검사하기", "안내문이 비어 있습니다. 붙여넣거나 파일을 열어 주세요.", parent=self)
+            return
+        try:
+            _, self.findings, self.deadlines = self.core.run_lint(text, self.today)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("검사 중 오류", f"{type(e).__name__}: {e}", parent=self)
+            return
+        self.score = self.core.compute_score(self.findings)
+        self.paint_editor()
+        self.draw_score()
+        self.timeline.config(text=self.core.format_timeline(self.deadlines, self.today))
+        self.render_findings()
+
+    def paint_editor(self):
+        for tag in ("warn", "info", "focus"):
+            self.editor.tag_remove(tag, "1.0", "end")
+        for f in self.findings:
+            tag = "warn" if f.severity == "경고" else "info"
+            for n in f.line_nos:
+                self.editor.tag_add(tag, f"{n}.0", f"{n}.end")
+        self.editor.tag_raise("warn", "info")
+        self.editor.tag_raise("focus")
+
+    def draw_score(self):
+        c, sc = self.score_cv, self.score
+        c.delete("all")
+        color = GRADE_COLORS[sc.grade]
+        c.create_oval(14, 11, 112, 109, fill=color, outline="")
+        c.create_text(63, 54, text=sc.grade, fill="white", font=(self.ui, 38, "bold"))
+        c.create_text(63, 94, text=f"{sc.total}점", fill="white", font=self.f(11, True))
+        rows = [("명확성", sc.clarity), ("일관성", sc.consistency), ("완전성", sc.completeness), ("일정", sc.schedule)]
+        width = 170
+        for i, (name, v) in enumerate(rows):
+            y = 25 + i * 27
+            c.create_text(138, y, text=name, anchor="w", fill=INK, font=self.f(10))
+            c.create_rectangle(206, y - 6, 206 + width, y + 6, fill=LINE, outline="")
+            col = OK if v >= 80 else (INFO if v >= 60 else WARN)
+            c.create_rectangle(206, y - 6, 206 + width * v / 100, y + 6, fill=col, outline="")
+            c.create_text(206 + width + 10, y, text=str(v), anchor="w", fill=INK, font=self.f(10, True))
+        self.grade_msg.config(text=self.core.GRADE_COMMENT[sc.grade])
+
+    def render_findings(self):
+        for w in self.cards.winfo_children():
+            w.destroy()
+        n_warn = sum(1 for f in self.findings if f.severity == "경고")
+        self.count_label.config(text=f"경고 {n_warn}건, 참고 {len(self.findings) - n_warn}건")
+        kind = self.kind_var.get()
+        items = [f for f in self.findings if kind == "전체" or f.kind == kind]
+        if not items:
+            msg = "발견된 문제가 없습니다." if not self.findings else "이 분류에는 항목이 없습니다."
+            tk.Label(self.cards, text=msg, bg=PAPER, fg=MUTED, font=self.f(11)).pack(pady=30)
+            return
+        for f in items:
+            self.make_card(f)
+
+    def make_card(self, f):
+        col = WARN if f.severity == "경고" else INFO
+        card = tk.Frame(self.cards, bg=CARD, highlightbackground=LINE, highlightthickness=1)
+        card.pack(fill="x", padx=(0, 8), pady=4)
+        tk.Frame(card, bg=col, width=6).pack(side="left", fill="y")
+        body = tk.Frame(card, bg=CARD)
+        body.pack(side="left", fill="both", expand=True, padx=12, pady=9)
+        labels = []
+
+        def add(text, fg=INK, font=None, pady=0):
+            lb = tk.Label(body, text=text, bg=CARD, fg=fg, font=font or self.f(10), anchor="w", justify="left")
+            lb.pack(fill="x", pady=(pady, 0))
+            labels.append(lb)
+
+        where = f"  {', '.join(map(str, f.line_nos))}행" if f.line_nos else ""
+        add(f"{f.severity}  {f.kind}{where}", col, self.f(9, True))
+        add(f.message, INK, self.f(11, True), 2)
+        if f.lenient or f.strict:
+            add("학생 A  " + f.lenient.replace("학생 A: ", ""), MUTED, self.f(9), 5)
+            add("학생 B  " + f.strict.replace("학생 B: ", ""), MUTED, self.f(9))
+        if f.question:
+            add("확인 질문  " + f.question, INK, self.f(10), 5)
+        if f.rewrite:
+            add("고쳐 쓰기  " + f.rewrite, OK, self.f(10), 3)
+
+        body.bind("<Configure>", lambda e, ls=labels: [l.config(wraplength=max(120, e.width - 6)) for l in ls])
+        self._bind_all_children(card, "<Button-1>", lambda e, fi=f: self.jump(fi))
+        self._bind_all_children(card, "<Enter>", lambda e, c=card: c.config(cursor="hand2"))
+
+    def _bind_all_children(self, w, seq, fn):
+        w.bind(seq, fn)
+        for ch in w.winfo_children():
+            self._bind_all_children(ch, seq, fn)
+
+    def jump(self, f):
+        self.editor.tag_remove("focus", "1.0", "end")
+        for n in f.line_nos:
+            self.editor.tag_add("focus", f"{n}.0", f"{n}.end")
+        if f.line_nos:
+            self.editor.see(f"{f.line_nos[0]}.0")
+
+    def show_mail(self):
+        if not self.findings:
+            messagebox.showinfo("질문 메일", "먼저 검사하기를 눌러 주세요.", parent=self)
+            return
+        body = self.core.build_mail(self.source, self.findings, 7)
+        win = tk.Toplevel(self)
+        win.title("질문 메일 초안")
+        win.geometry("640x560")
+        win.configure(bg=PAPER)
+        box, t = self.text_box(win)
+        box.pack(fill="both", expand=True, padx=14, pady=(14, 8))
+        t.insert("1.0", body)
+
+        def copy():
+            self.clipboard_clear()
+            self.clipboard_append(t.get("1.0", "end-1c"))
+            copy_btn.config(text="복사했어요")
+
+        row = tk.Frame(win, bg=PAPER)
+        row.pack(fill="x", padx=14, pady=(0, 14))
+        copy_btn = self.button(row, "전체 복사", copy, "mark")
+        copy_btn.pack(side="left")
+        self.button(row, "닫기", win.destroy).pack(side="left", padx=8)
+
+    def save_report(self):
+        if not self.findings and self.score is None:
+            messagebox.showinfo("보고서 저장", "먼저 검사하기를 눌러 주세요.", parent=self)
+            return
+        path = filedialog.asksaveasfilename(
+            title="보고서 저장", defaultextension=".html", initialfile="lint_report.html",
+            filetypes=[("HTML 보고서", "*.html"), ("텍스트", "*.txt"), ("Markdown", "*.md")])
+        if not path:
+            return
+        report = self.core.build_instructor_report(self.source, self.findings, self.deadlines, self.today)
+        self.core.write_report(path, report, self.findings, self.deadlines, self.source, self.today)
+        if path.lower().endswith(".html"):
+            webbrowser.open(Path(path).as_uri())
+
+    # ------------------------------------------------------------ 탭 2: 체크리스트
+    def _tab_check(self):
+        tab = tk.Frame(self.nb, bg=PAPER)
+        self.nb.add(tab, text="  제출 체크리스트  ")
+        top = tk.Frame(tab, bg=PAPER)
+        top.pack(fill="x", padx=16, pady=(16, 8))
+        self.button(top, "현재 안내문에서 요구사항 뽑기", self.extract_check, "mark").pack(side="left")
+        self.button(top, "항목 추가", self.add_item).pack(side="left", padx=8)
+        self.button(top, "수정", self.edit_item).pack(side="left")
+        self.button(top, "삭제", self.delete_item).pack(side="left", padx=8)
+        self.button(top, "점검 보고서 저장", self.save_student_report).pack(side="right")
+
+        prog = tk.Frame(tab, bg=PAPER)
+        prog.pack(fill="x", padx=16)
+        self.pbar = ttk.Progressbar(prog, maximum=100, style="Horizontal.TProgressbar")
+        self.pbar.pack(side="left", fill="x", expand=True)
+        self.prog_label = tk.Label(prog, text="", bg=PAPER, fg=INK, font=self.f(10, True), width=16, anchor="e")
+        self.prog_label.pack(side="right")
+
+        mid = tk.Frame(tab, bg=LINE)
+        mid.pack(fill="both", expand=True, padx=16, pady=10)
+        cols = ("done", "cat", "str", "text")
+        self.tree = ttk.Treeview(mid, columns=cols, show="headings", selectmode="browse")
+        for key, title, w, anc in (("done", "완료", 60, "center"), ("cat", "분류", 90, "center"),
+                                   ("str", "강도", 80, "center"), ("text", "요구사항", 800, "w")):
+            self.tree.heading(key, text=title)
+            self.tree.column(key, width=w, anchor=anc, stretch=(key == "text"))
+        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.tree.pack(fill="both", expand=True, padx=1, pady=1)
+        self.tree.tag_configure("done", foreground=MUTED)
+        self.tree.bind("<Button-1>", self.on_tree_click)
+        self.tree.bind("<Double-1>", lambda e: self.edit_item() if self.tree.identify_column(e.x) == "#4" else None)
+
+        self.due_label = tk.Label(tab, text="", bg=PAPER, fg=MUTED, font=(self.mono, 9), anchor="w", justify="left")
+        self.due_label.pack(fill="x", padx=16, pady=(0, 12))
+
+    def save_check(self):
+        try:
+            self.checklist.save(self.state_path)
+        except OSError as e:
+            messagebox.showerror("저장 실패", str(e), parent=self)
+
+    def refresh_check(self):
+        self.tree.delete(*self.tree.get_children())
+        for it in self.checklist.items:
+            self.tree.insert("", "end", iid=str(it.id), values=("☑" if it.done else "☐", it.category, it.strength, it.text),
+                             tags=("done",) if it.done else ())
+        done, total = self.checklist.progress()
+        self.pbar["value"] = (done / total * 100) if total else 0
+        self.prog_label.config(text=f"{done} / {total} 완료")
+        dls = self.checklist.deadline_infos()
+        self.due_label.config(text=self.core.format_timeline(dls, self.today) if dls else "")
+
+    def on_tree_click(self, e):
+        if self.tree.identify_region(e.x, e.y) != "cell" or self.tree.identify_column(e.x) != "#1":
+            return
+        iid = self.tree.identify_row(e.y)
+        item = self.checklist.get(int(iid)) if iid else None
+        if item:
+            item.done = not item.done
+            self.save_check()
+            self.refresh_check()
+            return "break"
+
+    def selected_item(self):
+        sel = self.tree.selection()
+        return self.checklist.get(int(sel[0])) if sel else None
+
+    def extract_check(self):
+        if self.checklist.items and not messagebox.askyesno(
+                "요구사항 뽑기", "기존 체크리스트가 사라지고 새로 만들어집니다. 계속할까요?", parent=self):
+            return
+        text = self.editor.get("1.0", "end-1c")
+        sentences = self.core.split_sentences(text)
+        cl = self.core.Checklist(source=self.source)
+        cl.items = self.core.extract_requirements(sentences)
+        cl.deadlines = [d.to_dict() for d in self.core.extract_deadlines(sentences, self.today) if d.is_deadline]
+        self.checklist = cl
+        self.save_check()
+        self.refresh_check()
+        self.nb.select(1)
+
+    def add_item(self):
+        text = simpledialog.askstring("항목 추가", "새 요구사항을 입력하세요", parent=self)
+        if text and text.strip():
+            self.checklist.add(text)
+            self.save_check()
+            self.refresh_check()
+
+    def edit_item(self):
+        it = self.selected_item()
+        if not it:
+            messagebox.showinfo("수정", "수정할 항목을 먼저 선택하세요.", parent=self)
+            return
+        text = simpledialog.askstring("항목 수정", "내용을 수정하세요", initialvalue=it.text, parent=self)
+        if text and text.strip():
+            self.checklist.edit(it.id, text)
+            self.save_check()
+            self.refresh_check()
+
+    def delete_item(self):
+        it = self.selected_item()
+        if it and messagebox.askyesno("삭제", f"#{it.id} 항목을 삭제할까요?", parent=self):
+            self.checklist.delete(it.id)
+            self.save_check()
+            self.refresh_check()
+
+    def save_student_report(self):
+        path = filedialog.asksaveasfilename(title="점검 보고서 저장", defaultextension=".txt",
+                                            initialfile="student_report.txt", filetypes=[("텍스트", "*.txt")])
+        if path:
+            Path(path).write_text(self.core.build_student_report(self.checklist, self.today), encoding="utf-8")
+
+    # ------------------------------------------------------------ 탭 3: 제출물 검수
+    def _tab_audit(self):
+        tab = tk.Frame(self.nb, bg=PAPER)
+        self.nb.add(tab, text="  제출물 검수  ")
+        top = tk.Frame(tab, bg=PAPER)
+        top.pack(fill="x", padx=16, pady=(16, 6))
+        self.button(top, "폴더 선택", lambda: self.run_audit_for("dir"), "mark").pack(side="left")
+        self.button(top, "zip 파일 선택", lambda: self.run_audit_for("zip")).pack(side="left", padx=8)
+        tk.Label(tab, text="‘안내문 점검’ 탭에 있는 안내문을 기준으로 파일명, 형식, 용량, 금지된 import를 확인합니다.",
+                 bg=PAPER, fg=MUTED, font=self.f(9)).pack(anchor="w", padx=16, pady=(0, 8))
+        box, self.audit_text = self.text_box(tab, mono=True)
+        box.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+        t = self.audit_text
+        t.tag_configure("통과", foreground=OK)
+        t.tag_configure("경고", foreground=WARN)
+        t.tag_configure("확인", foreground=INFO)
+        t.tag_configure("head", font=(self.ui, 11, "bold"))
+        t.insert("1.0", "제출할 폴더나 zip 파일을 선택하면 결과가 여기에 표시됩니다.")
+
+    def run_audit_for(self, kind):
+        path = filedialog.askdirectory(title="제출 폴더 선택") if kind == "dir" else filedialog.askopenfilename(
+            title="zip 선택", filetypes=[("zip", "*.zip"), ("모든 파일", "*.*")])
+        if not path:
+            return
+        notice = self.editor.get("1.0", "end-1c")
+        try:
+            items = self.core.run_audit(notice, path)
+        except SystemExit as e:
+            messagebox.showerror("검수 실패", str(e), parent=self)
+            return
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("검수 중 오류", f"{type(e).__name__}: {e}", parent=self)
+            return
+        t = self.audit_text
+        t.delete("1.0", "end")
+        n_fail = sum(1 for i in items if i.level == "경고")
+        n_chk = sum(1 for i in items if i.level == "확인")
+        t.insert("end", f"{Path(path).name}\n", "head")
+        t.insert("end", f"경고 {n_fail}건, 직접 확인 {n_chk}건\n\n", "head")
+        for it in items:
+            t.insert("end", f"[{it.level}] ", it.level)
+            t.insert("end", it.message + "\n")
+        t.insert("end", "\n쪽수는 PDF 내부 구조로 추정한 값입니다. 최종 판단은 직접 하세요.")
+
+    # ------------------------------------------------------------ 탭 4: 공지 비교
+    def _tab_diff(self):
+        tab = tk.Frame(self.nb, bg=PAPER)
+        self.nb.add(tab, text="  공지 정정 비교  ")
+        self.old_var, self.new_var = tk.StringVar(), tk.StringVar()
+        form = tk.Frame(tab, bg=PAPER)
+        form.pack(fill="x", padx=16, pady=(16, 8))
+        for r, (label, var) in enumerate((("이전 안내문", self.old_var), ("수정된 안내문", self.new_var))):
+            tk.Label(form, text=label, bg=PAPER, fg=INK, font=self.f(10, True), width=12, anchor="w").grid(
+                row=r, column=0, pady=4)
+            tk.Entry(form, textvariable=var, font=self.f(10), relief="flat", bg=CARD, highlightthickness=1,
+                     highlightbackground=LINE).grid(row=r, column=1, sticky="ew", ipady=5, padx=6)
+            self.button(form, "찾아보기", lambda v=var: self.pick_file(v)).grid(row=r, column=2)
+        form.columnconfigure(1, weight=1)
+        self.button(form, "비교하기", self.run_diff, "mark").grid(row=2, column=1, sticky="w", padx=6, pady=8)
+        box, self.diff_text = self.text_box(tab, mono=True)
+        box.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+        t = self.diff_text
+        t.tag_configure("head", font=(self.ui, 11, "bold"))
+        t.tag_configure("del", foreground=WARN, overstrike=True)
+        t.tag_configure("add", foreground=OK, font=(self.mono, 10, "bold"))
+        t.tag_configure("risk", foreground=INFO, font=(self.mono, 10, "bold"))
+        t.insert("1.0", "두 안내문을 고르고 비교하기를 누르면 바뀐 요구사항만 보여 줍니다.")
+
+    def pick_file(self, var):
+        p = filedialog.askopenfilename(filetypes=[("텍스트", "*.txt *.md"), ("모든 파일", "*.*")])
+        if p:
+            var.set(p)
+
+    def run_diff(self):
+        old, new = self.old_var.get().strip(), self.new_var.get().strip()
+        if not (old and new):
+            messagebox.showinfo("비교하기", "두 파일을 모두 선택해 주세요.", parent=self)
+            return
+        try:
+            report = self.core.build_diff_report(old, new, self.today)
+        except SystemExit as e:
+            messagebox.showerror("비교 실패", str(e), parent=self)
+            return
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("비교 중 오류", f"{type(e).__name__}: {e}", parent=self)
+            return
+        t = self.diff_text
+        t.delete("1.0", "end")
+        t.insert("1.0", report)
+        for pattern, tag in ((r"\[-.*?-\]", "del"), (r"\{\+.*?\+\}", "add"), (r"⚠.*", "risk"), (r"■.*", "head")):
+            start = "1.0"
+            while True:
+                idx = t.search(pattern, start, stopindex="end", regexp=True)
+                if not idx:
+                    break
+                line_end = t.index(f"{idx} lineend")
+                m = re.compile(pattern).search(t.get(idx, line_end))
+                end = f"{idx}+{m.end()}c" if m else line_end
+                t.tag_add(tag, idx, end)
+                start = end
+
+
+# ---------------------------------------------------------------- 실행
+def main():
+    try:  # 윈도우 고해상도 화면에서 글자가 흐려지지 않게
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:  # noqa: BLE001
+        pass
+    core, name = load_core()
+    if core is None:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(
+            "린터 파일을 찾을 수 없습니다",
+            "linter_gui.py와 같은 폴더에 기존 린터 파일(term_project_oss_demo.py)을 넣어 주세요.")
+        return
+    App(core, name).mainloop()
+
+
+if __name__ == "__main__":
+    main()
