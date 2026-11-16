@@ -1,3 +1,9 @@
+"""과제 안내문 린터 - 데스크톱 화면 (tkinter)
+
+사용법: 기존 린터 파일(term_project_oss_demo.py)과 같은 폴더에 두고 실행하세요.
+  VS Code에서 ▶ 버튼을 누르거나  python linter_gui.py
+기존 파일의 검사 로직을 그대로 불러와 쓰므로, 기존 파일은 수정하지 않아도 됩니다.
+"""
 from __future__ import annotations
 
 import importlib.util
@@ -13,13 +19,13 @@ from tkinter import font as tkfont
 HERE = Path(__file__).resolve().parent
 
 # ---------------------------------------------------------------- 색상
-INK = "#1E2A44"        # 헤더·본문 글자
+INK = "#1B1F23"; PAPER = "#F1F3F2"; CARD = "#FFFFFF"; LINE = "#D8DDDA"; MUTED = "#6A7570"
+MARK = "#3FBF93"
+WARN = "#B8433A"; WARN_BG = "#F5DCD8"; INFO = "#A87C24"; INFO_BG = "#F3E8CC"; OK = "#2C8A66"
 PAPER = "#F4F6FB"      # 바탕
 CARD = "#FFFFFF"
 LINE = "#DCE1EE"
 MUTED = "#66728F"
-MARK = "#FFE45C"       # 형광펜: 이 앱의 포인트 색 (검사 버튼, 선택한 줄)
-WARN = "#D64545"
 WARN_BG = "#FFDADA"
 INFO = "#C98A1B"
 INFO_BG = "#FFF0C2"
@@ -183,7 +189,7 @@ class App(tk.Tk):
         bar.pack(fill="x")
         left = tk.Frame(bar, bg=INK)
         left.pack(side="left", padx=22, pady=14)
-        tk.Label(left, text="과제 안내문 린터", bg=INK, fg="white", font=self.f(17, True)).pack(anchor="w")
+        tk.Label(left, text="과제 안내문 점검", bg=INK, fg="white", font=self.f(17, True)).pack(anchor="w")
         tk.Label(left, text="안내문의 모호함, 충돌, 마감 문제를 제출 전에 찾아냅니다", bg=INK, fg="#AEB9D6",
                  font=self.f(10)).pack(anchor="w", pady=(2, 0))
         right = tk.Frame(bar, bg=INK)
